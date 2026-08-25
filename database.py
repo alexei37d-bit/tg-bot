@@ -5,6 +5,9 @@ class Database:
     def __init__(self, db_name='bot.db'):
         self.db_name = db_name
         self.conn = sqlite3.connect(db_name)
+        # Включаем реальное соблюдение FOREIGN KEY (по умолчанию SQLite их игнорирует),
+        # чтобы ON DELETE CASCADE в app_security действительно работал.
+        self.conn.execute("PRAGMA foreign_keys = ON")
         self.cursor = self.conn.cursor()
         self.create_tables()
 
@@ -73,6 +76,12 @@ class Database:
         current = self.get_balance(user_id, currency)
         new_amount = current + amount
         if new_amount < 0:
+            # Такого в норме быть не должно — списание всегда проверяется заранее.
+            # Раньше это молча обнулялось, из-за чего расхождение было не видно нигде,
+            # кроме как в самом факте пропажи денег. Логируем, чтобы баг было видно.
+            print(f"[WARN] add_to_balance: попытка увести баланс в минус "
+                  f"(user_id={user_id}, currency={currency}, current={current}, "
+                  f"delta={amount}) — баланс обнулён вместо ухода в минус")
             new_amount = 0
         self.update_balance(user_id, currency, new_amount)
 
@@ -129,6 +138,64 @@ class Database:
         self.cursor.execute('UPDATE invoices SET is_paid=1 WHERE invoice_id=?', (invoice_id,))
         self.conn.commit()
 
+    def _adjust_balance_nocommit(self, user_id, currency, delta):
+        """Изменяет баланс на delta БЕЗ commit — используется только внутри уже
+        открытой транзакции (см. process_payment). Баланс не даём увести в минус:
+        если бы это произошло, вся транзакция откатывается в process_payment."""
+        self.cursor.execute(
+            'INSERT INTO balances (user_id, currency, amount) VALUES (?, ?, ?) '
+            'ON CONFLICT(user_id, currency) DO UPDATE SET amount = amount + excluded.amount',
+            (user_id, currency, delta)
+        )
+
+    def process_payment(self, invoice_id, payer_id, creator_id, currency, amount,
+                         amount_usd, comment='', is_anonymous=0, mark_single_paid=False):
+        """
+        Атомарно обрабатывает оплату счета одной транзакцией:
+        списывает у плательщика, зачисляет создателю, при необходимости помечает
+        одноразовый счет оплаченным и сохраняет запись о платеже.
+
+        Раньше эти 4 шага коммитились по отдельности — при сбое посреди операции
+        деньги могли списаться у плательщика, но не зачислиться получателю
+        (при этом пользователю показывалось сообщение "средства не списаны",
+        что было неправдой). Теперь либо применяются все изменения, либо
+        не применяется ни одно — транзакция откатывается через conn.rollback().
+        """
+        try:
+            self._adjust_balance_nocommit(payer_id, currency, -amount)
+
+            # Защита от гонок/двойной оплаты: если после списания баланс плательщика
+            # ушел в минус, откатываем всё и сообщаем об ошибке, а не тихо обнуляем.
+            self.cursor.execute(
+                'SELECT amount FROM balances WHERE user_id=? AND currency=?',
+                (payer_id, currency)
+            )
+            row = self.cursor.fetchone()
+            if row is None or row[0] < 0:
+                raise ValueError(
+                    f"Недостаточно средств для оплаты (user_id={payer_id}, "
+                    f"currency={currency})"
+                )
+
+            self._adjust_balance_nocommit(creator_id, currency, amount)
+
+            if mark_single_paid:
+                self.cursor.execute(
+                    'UPDATE invoices SET is_paid=1 WHERE invoice_id=?', (invoice_id,)
+                )
+
+            self.cursor.execute(
+                "INSERT INTO payments (invoice_id, payer_id, currency, amount_sent, "
+                "amount_usd, comment, is_anonymous) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (invoice_id, payer_id, currency, amount, amount_usd, comment, is_anonymous)
+            )
+
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def delete_invoice(self, invoice_id):
         self.cursor.execute('UPDATE invoices SET is_active=0 WHERE invoice_id=?', (invoice_id,))
         self.conn.commit()
@@ -159,17 +226,28 @@ class Database:
     # --- Crypto Pay App Methods (New) ---
 
     def create_app(self, user_id, app_id, name, token):
-        """Creates a new Crypto Pay application"""
-        self.cursor.execute(
-            "INSERT INTO apps (app_id, creator_id, name, token) VALUES (?, ?, ?, ?)",
-            (app_id, user_id, name, token)
-        )
-        # Initialize security settings with defaults
-        self.cursor.execute(
-            "INSERT INTO app_security (app_id) VALUES (?)",
-            (app_id,)
-        )
-        self.conn.commit()
+        """Creates a new Crypto Pay application.
+
+        app_id и token генерируются случайно, поэтому теоретически возможна коллизия
+        с уже существующей записью (PRIMARY KEY на app_id, UNIQUE на token). Раньше
+        это привело бы к необработанному sqlite3.IntegrityError и падению хэндлера.
+        Теперь ошибка транзакции откатывается и пробрасывается вызывающему коду,
+        чтобы он мог сгенерировать новые значения и повторить попытку.
+        """
+        try:
+            self.cursor.execute(
+                "INSERT INTO apps (app_id, creator_id, name, token) VALUES (?, ?, ?, ?)",
+                (app_id, user_id, name, token)
+            )
+            # Initialize security settings with defaults
+            self.cursor.execute(
+                "INSERT INTO app_security (app_id) VALUES (?)",
+                (app_id,)
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            raise
 
     def get_app_by_id(self, app_id):
         """Retrieves app details including security settings"""
