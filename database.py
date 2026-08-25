@@ -205,8 +205,19 @@ class Database:
         return [row[0] for row in self.cursor.fetchall()]
 
     def get_active_invoices_for_list(self, user_id):
-        self.cursor.execute("SELECT invoice_id FROM invoices WHERE creator_id=? AND is_active=1 AND NOT (invoice_type='single' AND is_paid=1)", (user_id,))
-        return [row[0] for row in self.cursor.fetchall()]
+        """Возвращает активные счета пользователя с данными, нужными для списка
+        (id, тип, сумма) — без отдельного запроса на каждый счет. Уже оплаченные
+        одноразовые счета не включаются. Сортировка от новых к старым."""
+        self.cursor.execute(
+            "SELECT invoice_id, invoice_type, amount_usd FROM invoices "
+            "WHERE creator_id=? AND is_active=1 AND NOT (invoice_type='single' AND is_paid=1) "
+            "ORDER BY created_at DESC",
+            (user_id,)
+        )
+        return [
+            {'invoice_id': row[0], 'invoice_type': row[1], 'amount_usd': row[2]}
+            for row in self.cursor.fetchall()
+        ]
 
     def add_payment(self, invoice_id, payer_id, currency, amount_sent, amount_usd, comment='', is_anonymous=0):
         self.cursor.execute("INSERT INTO payments (invoice_id, payer_id, currency, amount_sent, amount_usd, comment, is_anonymous) VALUES (?, ?, ?, ?, ?, ?, ?)", 
@@ -325,4 +336,3 @@ class Database:
 
     def close(self):
         self.conn.close()
-
