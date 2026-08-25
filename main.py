@@ -4,6 +4,8 @@ import random
 import string
 import secrets
 import html
+import sqlite3
+import aiohttp
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -41,6 +43,68 @@ USD_RATES = {
     "USDT": 1.0, "USDC": 1.0, "BTC": 77235, "ETH": 2431, "SOL": 93,
     "GRAM": 1.78, "TRX": 0.3431, "DOGE": 0.1, "LTC": 51, "BNB": 697, "XAUT": 4579
 }
+# ^ Это только резервные значения на случай, если при старте бота курсы ещё не
+# успели подтянуться с биржи/агрегатора (см. ниже). В рабочем режиме bot обновляет
+# эти же ключи реальными курсами — весь остальной код обращается к USD_RATES.get(...)
+# и никаких других правок не требует.
+
+# Соответствие внутренних тикеров идентификаторам CoinGecko — публичное бесплатное
+# API курсов криптовалют, ключ не нужен.
+COINGECKO_IDS = {
+    "USDT": "tether", "USDC": "usd-coin", "BTC": "bitcoin", "ETH": "ethereum",
+    "SOL": "solana", "GRAM": "the-open-network", "TRX": "tron", "DOGE": "dogecoin",
+    "LTC": "litecoin", "BNB": "binancecoin", "XAUT": "tether-gold",
+}
+
+RATES_REFRESH_INTERVAL_SECONDS = 5 * 60  # как часто обновлять курсы, пока бот работает
+RATES_REQUEST_TIMEOUT_SECONDS = 10
+rates_last_updated = None  # datetime последнего успешного обновления (UTC), для /rates и т.п.
+
+async def fetch_crypto_rates():
+    """Подтягивает актуальные курсы криптовалют к USD с CoinGecko и обновляет USD_RATES.
+
+    При любой ошибке (нет сети, API недоступен, некорректный ответ) прежние курсы
+    НЕ затираются — бот продолжает работать на последних известных значениях,
+    просто выводится предупреждение в лог. Так платежи не считаются по нулевым
+    или битым курсам, даже если API временно лежит."""
+    global rates_last_updated
+    ids = ",".join(COINGECKO_IDS.values())
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+    try:
+        timeout = aiohttp.ClientTimeout(total=RATES_REQUEST_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    print(f"[WARN] Курсы валют: CoinGecko вернул HTTP {resp.status}, "
+                          f"использую прежние значения")
+                    return
+                data = await resp.json()
+
+        updated = []
+        for ticker, cg_id in COINGECKO_IDS.items():
+            price = data.get(cg_id, {}).get("usd")
+            if isinstance(price, (int, float)) and price > 0:
+                USD_RATES[ticker] = float(price)
+                updated.append(ticker)
+
+        if updated:
+            rates_last_updated = datetime.utcnow()
+            print(f"[INFO] Курсы валют обновлены ({len(updated)}/{len(COINGECKO_IDS)}): "
+                  f"{', '.join(updated)}")
+        else:
+            print("[WARN] Курсы валют: ответ CoinGecko не содержал ни одного известного тикера, "
+                  "использую прежние значения")
+    except asyncio.TimeoutError:
+        print("[WARN] Курсы валют: тайм-аут запроса к CoinGecko, использую прежние значения")
+    except Exception as e:
+        print(f"[WARN] Курсы валют: ошибка при обновлении ({e}), использую прежние значения")
+
+async def rates_refresh_loop():
+    """Фоновая задача: обновляет курсы каждые RATES_REFRESH_INTERVAL_SECONDS,
+    пока бот работает."""
+    while True:
+        await asyncio.sleep(RATES_REFRESH_INTERVAL_SECONDS)
+        await fetch_crypto_rates()
 
 CURRENCY_ORDER = ["USDT", "GRAM", "SOL", "TRX", "BTC", "ETH", "DOGE", "LTC", "BNB", "USDC", "XAUT"]
 
@@ -166,6 +230,18 @@ wallet_keyboard = InlineKeyboardMarkup(inline_keyboard=[
 # ==========================================
 # ОБЩИЕ ХЕНДЛЕРЫ
 # ==========================================
+@dp.message(Command("rates"))
+async def show_rates(message: types.Message):
+    """Показывает текущие курсы криптовалют к USD и когда они обновлялись
+    (для проверки, что бот действительно берет живые курсы, а не резервные)."""
+    if rates_last_updated:
+        updated_str = (rates_last_updated + timedelta(hours=PAID_TIME_TZ_OFFSET_HOURS)).strftime("%d.%m.%Y %H:%M")
+        status_line = f"Обновлено: {updated_str} (GMT+{PAID_TIME_TZ_OFFSET_HOURS})"
+    else:
+        status_line = "⚠️ Ещё не получены с CoinGecko — показаны резервные значения"
+    lines = [f"1 {c} ≈ ${format_usd(USD_RATES[c])}" for c in CURRENCY_ORDER]
+    await message.answer(f"<b>Курсы валют</b>\n{status_line}\n\n" + "\n".join(lines), parse_mode='HTML')
+
 @dp.message(Command("start"))
 async def send_welcome(message: types.Message):
     db.add_user(message.from_user.id)
@@ -284,15 +360,25 @@ async def cp_my_apps(callback: types.CallbackQuery):
 async def cp_create_app(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     
-    # Генерация данных
-    app_id = generate_app_id()
-    app_name = generate_random_app_name()
-    api_token = generate_api_token()
-    
-    # Сохранение в БД
-    # Ожидаемый метод: create_app(user_id, app_id, name, token)
+    # Генерация данных. app_id/token случайны, поэтому в редком случае коллизии
+    # с уже существующей записью пробуем ещё раз (несколько попыток) вместо падения.
+    app_id = None
     if hasattr(db, 'create_app'):
-        db.create_app(user_id=user_id, app_id=app_id, name=app_name, token=api_token)
+        for _ in range(5):
+            app_id = generate_app_id()
+            app_name = generate_random_app_name()
+            api_token = generate_api_token()
+            try:
+                db.create_app(user_id=user_id, app_id=app_id, name=app_name, token=api_token)
+                break
+            except sqlite3.IntegrityError as e:
+                print(f"[WARN] create_app: коллизия app_id/token, повторная попытка: {e}")
+                app_id = None
+        if app_id is None:
+            await callback.answer("Не удалось создать приложение, попробуйте ещё раз.", show_alert=True)
+            return
+    else:
+        app_id = generate_app_id()
     
     # Сохраняем текущее открытое приложение в стейт для удобства навигации
     user_states[user_id] = {'current_app_id': app_id, 'step': 'app_dashboard'}
@@ -1635,15 +1721,21 @@ async def back_to_payment_select(callback: types.CallbackQuery):
 
 async def update_paid_invoice_messages(invoice_id, amount_usd):
     """Помечает все расшаренные сообщения этого (одноразового) счета как оплаченные —
-    редактирует их прямо в тех чатах, куда счет был переслан через инлайн."""
+    редактирует их прямо в тех чатах, куда счет был переслан через инлайн.
+
+    Кнопка остается такой же ссылкой на счет (url=...), как и до оплаты — просто
+    меняется текст на "Оплачено". Раньше кнопка подменялась на callback_data,
+    который вел в никуда (просто показывал алерт) — теперь ссылка сохраняется,
+    и по ней по-прежнему можно открыть счет в боте."""
     inline_message_ids = db.get_invoice_messages(invoice_id)
     if not inline_message_ids:
         return
+    bot_username = (await bot.get_me()).username
     header = f"<tg-emoji emoji-id=\"5312043357311111246\">📥</tg-emoji> Счет на ${format_balance(amount_usd)}."
     paid_line = f"✅ Оплачен {format_paid_datetime()}"
     text = f"{header}\n\n{paid_line}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Оплачено: ${format_balance(amount_usd)}", callback_data=f"already_paid_{invoice_id}")]
+        [InlineKeyboardButton(text="✅ Оплачено", url=f"https://t.me/{bot_username}?start={invoice_id}")]
     ])
     for inline_message_id in inline_message_ids:
         try:
@@ -1652,10 +1744,6 @@ async def update_paid_invoice_messages(invoice_id, amount_usd):
             pass
         except Exception as e:
             print(f"Не удалось обновить расшаренное сообщение счета {invoice_id}: {e}")
-
-@dp.callback_query(lambda c: c.data.startswith("already_paid_"))
-async def already_paid_noop(callback: types.CallbackQuery):
-    await callback.answer("Счет уже оплачен.", show_alert=True)
 
 @dp.callback_query(lambda c: c.data.startswith("process_payment_"))
 async def process_payment(callback: types.CallbackQuery):
@@ -1694,10 +1782,20 @@ async def process_payment(callback: types.CallbackQuery):
         await callback.answer("Создатель счета запретил комментарии.", show_alert=True); return
         
     try:
-        db.add_to_balance(user_id, currency, -amount_in_currency)
-        db.add_to_balance(invoice['creator_id'], currency, amount_in_currency)
-        if invoice['invoice_type'] == 'single': db.mark_invoice_paid(invoice_id)
-        db.add_payment(invoice_id, user_id, currency, amount_in_currency, amount_usd, comment, is_anonymous)
+        # Все 4 шага (списание, зачисление, отметка "оплачено", запись платежа)
+        # выполняются одной транзакцией: либо применяются все, либо ни один
+        # (см. Database.process_payment) — деньги гарантированно не "теряются" по пути.
+        db.process_payment(
+            invoice_id=invoice_id,
+            payer_id=user_id,
+            creator_id=invoice['creator_id'],
+            currency=currency,
+            amount=amount_in_currency,
+            amount_usd=amount_usd,
+            comment=comment,
+            is_anonymous=is_anonymous,
+            mark_single_paid=(invoice['invoice_type'] == 'single'),
+        )
     except Exception as e:
         print(f"Error during payment transaction: {e}")
         await callback.answer("Произошла ошибка при обработке платежа. Средства не списаны.", show_alert=True); return
@@ -1738,9 +1836,14 @@ async def process_payment(callback: types.CallbackQuery):
 # ==========================================
 async def main():
     print("Бот запущен...")
+    # Тянем реальные курсы перед стартом поллинга, чтобы бот не открылся
+    # на резервных (потенциально устаревших) значениях из USD_RATES.
+    await fetch_crypto_rates()
+    refresh_task = asyncio.create_task(rates_refresh_loop())
     try:
         await dp.start_polling(bot)
     finally:
+        refresh_task.cancel()
         db.close()
 
 if __name__ == '__main__':
