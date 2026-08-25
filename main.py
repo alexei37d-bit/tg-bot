@@ -1165,8 +1165,11 @@ async def show_invoice_details(message_or_callback, invoice_id):
         f"Скопируйте ссылку, чтобы поделиться счетом:\n"
         f"https://t.me/{bot_username}?start={invoice_id}"
     )
-    keyboard_rows = [[InlineKeyboardButton(text="Поделиться счетом", switch_inline_query=invoice_id)]]
+    keyboard_rows = []
     if is_owner:
+        # Кнопка "Поделиться" доступна только владельцу счета — раньше её видел
+        # и мог ею воспользоваться любой, кто открыл чужой счет по ссылке.
+        keyboard_rows.append([InlineKeyboardButton(text="Поделиться счетом", switch_inline_query=invoice_id)])
         if is_open_amount(invoice):
             min_amt = invoice.get('min_amount_usd', 0.01)
             keyboard_rows.append([InlineKeyboardButton(text=f"Мин. сумма: ${format_balance(min_amt)}", callback_data=f"set_min_amount_{invoice_id}")])
@@ -1307,21 +1310,71 @@ async def process_min_amount(message: types.Message):
     user_states.pop(user_id, None)
     await show_invoice_details(message, invoice_id)
 
-@dp.callback_query(lambda c: c.data == "view_invoices")
+INVOICES_PER_PAGE = 6
+
+def format_invoice_list_label(inv):
+    """Подпись счета в списке: 'Многоразовый' для многоразовых счетов, сумма
+    (например '$1') для обычных активных счетов с фиксированной суммой,
+    и отдельная пометка для счетов с открытой суммой (плательщик сам её вводит)."""
+    if inv['invoice_type'] == 'multi':
+        return "Многоразовый"
+    if inv['amount_usd'] is None:
+        return "Открытая сумма"
+    return f"${format_balance(inv['amount_usd'])}"
+
+def build_invoices_list_keyboard(invoices, page):
+    """Клавиатура списка счетов с пагинацией: по INVOICES_PER_PAGE штук на страницу.
+    Если страниц больше одной — снизу добавляется навигация: в начало / назад /
+    номер страницы / вперед / сразу в конец."""
+    total_pages = max(1, (len(invoices) + INVOICES_PER_PAGE - 1) // INVOICES_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * INVOICES_PER_PAGE
+    page_invoices = invoices[start:start + INVOICES_PER_PAGE]
+
+    keyboard_rows = []
+    for inv in page_invoices:
+        label = format_invoice_list_label(inv)
+        keyboard_rows.append([InlineKeyboardButton(text=label, callback_data=f"view_invoice_{inv['invoice_id']}")])
+
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="« В начало", callback_data="view_invoices_page_0"))
+            nav_row.append(InlineKeyboardButton(text="‹", callback_data=f"view_invoices_page_{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="invoices_page_noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(text="›", callback_data=f"view_invoices_page_{page + 1}"))
+            nav_row.append(InlineKeyboardButton(text="В конец »", callback_data=f"view_invoices_page_{total_pages - 1}"))
+        keyboard_rows.append(nav_row)
+
+    keyboard_rows.append([InlineKeyboardButton(text="‹ Назад к счетам", callback_data="invoices")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+@dp.callback_query(lambda c: c.data == "view_invoices" or c.data.startswith("view_invoices_page_"))
 async def view_all_invoices(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    invoices_ids = db.get_active_invoices_for_list(user_id)
-    if not invoices_ids:
+    invoices = db.get_active_invoices_for_list(user_id)
+    if not invoices:
         await callback.answer("У вас нет активных счетов.", show_alert=True); return
-    keyboard_rows = []
-    for inv_id in invoices_ids:
-        keyboard_rows.append([InlineKeyboardButton(text=f"Счет {inv_id}", callback_data=f"view_invoice_{inv_id}")])
-    keyboard_rows.append([InlineKeyboardButton(text="‹ Назад к счетам", callback_data="invoices")])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+    page = 0
+    if callback.data.startswith("view_invoices_page_"):
+        try:
+            page = int(callback.data.replace("view_invoices_page_", ""))
+        except ValueError:
+            page = 0
+
+    keyboard = build_invoices_list_keyboard(invoices, page)
     try:
         await callback.message.edit_text("Ваши активные счета:", reply_markup=keyboard)
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e): raise e
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "invoices_page_noop")
+async def invoices_page_noop(callback: types.CallbackQuery):
+    """Кнопка с номером страницы ('2/5') — просто отображает текущую позицию,
+    сама по себе никуда не ведет."""
     await callback.answer()
 
 @dp.chosen_inline_result()
